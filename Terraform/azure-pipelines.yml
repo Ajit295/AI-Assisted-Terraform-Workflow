@@ -1,0 +1,175 @@
+parameters:
+  - name: environment
+    type: string
+    displayName: Select Environment to create resouces
+    default: Dev
+    values:
+      - Dev
+      - Prod
+
+# trigger:
+#   branches:
+#     include:
+#       - main
+
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+- group: Terraform-Backend
+- name: workingDir
+  value: 'Environments/${{ parameters.environment }}'
+- name: isPR
+  value: $[ eq(variables['Build.Reason'], 'PullRequest') ]
+
+stages:
+
+  - stage: CodeQuality
+    displayName: Scan Code Quality
+    condition: eq(variables['isPR'], true)
+    jobs:
+      - job: codequality
+        steps:
+
+        - task: TerraformInstaller@1
+          displayName: Install Terraform
+          inputs:
+            terraformVersion: '1.15.2'
+
+        - script: |
+            terraform fmt -check -recursive || true
+          displayName: Check Terraform Formatting
+
+        - script: |
+            pip install checkov
+          displayName: Install Checkov
+
+        - script: |
+            checkov -d $(Build.SourcesDirectory) -o sarif > $(Pipeline.Workspace)/checkov-report.sarif || true
+          displayName: Run Checkov Security Scan
+      
+        - task: PublishPipelineArtifact@1
+          displayName: Publish Checkov Report
+          inputs:
+            targetPath: '$(Pipeline.Workspace)/checkov-report.sarif'
+            artifact: 'checkov-report'
+            publishLocation: 'pipeline'
+
+# ---------------------- Validate the Terraform files ------------------------------#
+  - stage: Validate
+    displayName: Validate Terraform
+    condition: |
+      and(
+        succeeded('CodeQuality'),
+        eq(variables['isPR'], true)
+      )
+    dependsOn: CodeQuality
+    jobs:
+      - job: validate
+        continueOnError: false
+        steps:  
+          - task: TerraformInstaller@1
+            displayName: Terraform install
+            inputs:
+              terraformVersion: '1.15.2'
+
+          - task: TerraformTaskV4@4
+            displayName: Init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: $(workingDir)
+              backendServiceArm: $(ServiceConnectionName)
+              backendAzureRmResourceGroupName: $(backendAzureRmResourceGroupName)
+              backendAzureRmStorageAccountName: $(backendAzureRmStorageAccountName)
+              backendAzureRmContainerName: $(backendAzureRmContainerName)
+              backendAzureRmKey: '${{ parameters.environment }}/terraform.tfstate'
+              
+          - task: TerraformTaskV4@4
+            displayName: Validate
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: $(workingDir)
+  
+  # ------------------- Creating the tfplan and download plan for apply stage ------------------------#
+  - stage: Plan
+    displayName: Terraform Plan
+    condition: eq(variables['isPR'], false)
+    dependsOn: Validate
+    jobs:
+      - job: Plan
+        steps: 
+           - task: TerraformInstaller@1
+             displayName: Terraform install
+             inputs:
+              terraformVersion: '1.15.2'
+            
+           - task: TerraformTaskV4@4
+             displayName: Init
+             inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: $(workingDir)
+              backendServiceArm: $(ServiceConnectionName)
+              backendAzureRmResourceGroupName: $(backendAzureRmResourceGroupName)
+              backendAzureRmStorageAccountName: $(backendAzureRmStorageAccountName)
+              backendAzureRmContainerName: $(backendAzureRmContainerName)
+              backendAzureRmKey: '${{ parameters.environment }}/terraform.tfstate'
+
+           - task: TerraformTaskV4@4
+             displayName: Plan
+             inputs:
+               provider: 'azurerm'
+               command: 'plan'
+               workingDirectory: $(workingDir)
+               environmentServiceNameAzureRM: $(ServiceConnectionName)
+               commandOptions: '-out=tfplan -input=false'
+
+           - publish: $(workingDir)/tfplan
+             artifact: tfplan
+  #----------------------- Apply configuration with Approval (for Prod only ) ---------------------#
+  - stage: Apply
+    displayName: Terraform Apply
+    dependsOn: Plan
+    condition: succeeded('Plan')
+    jobs:
+      - deployment: apply
+        environment: ${{ parameters.environment}}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                # Downloading the Repository 
+                - checkout: self
+              
+                - task: TerraformInstaller@1
+                  displayName: Terraform install
+                  inputs:
+                    terraformVersion: '1.15.2'
+
+
+                - task: TerraformTaskV4@4
+                  displayName: Init
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    workingDirectory: $(workingDir)
+                    backendServiceArm: $(ServiceConnectionName)
+                    backendAzureRmResourceGroupName: $(backendAzureRmResourceGroupName)
+                    backendAzureRmStorageAccountName: $(backendAzureRmStorageAccountName)
+                    backendAzureRmContainerName: $(backendAzureRmContainerName)
+                    backendAzureRmKey: '${{ parameters.environment }}/terraform.tfstate'
+
+                - task: TerraformTaskV4@4
+                  displayName: Apply
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    workingDirectory: $(workingDir)
+                    environmentServiceNameAzureRM: $(ServiceConnectionName)
+                    # In Environment, the tfplan is downloading in Pipeline.Workspace directory automatically. 
+                    commandOptions: '$(Pipeline.Workspace)/tfplan/tfplan'
